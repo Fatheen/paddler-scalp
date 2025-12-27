@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Pattern / Paddler Scalp (Long Only)</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 16px; }
+    input { padding: 8px; font-size: 16px; width: 140px; }
+    button { padding: 8px 12px; font-size: 16px; cursor: pointer; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-top: 16px; }
+    .big { font-size: 22px; font-weight: bold; }
+    .muted { color: #666; }
+    pre { background: #f7f7f7; padding: 12px; border-radius: 8px; overflow: auto; }
+    .row { display: flex; gap: 10px; align-items: center; }
+  </style>
+</head>
+<body>
+  <h1>Pattern / Paddler Scalp — Long Only</h1>
+  <div class="row">
+    <label>Ticker:</label>
+    <input id="ticker" value="NVDA" />
+    <button id="run">Analyze</button>
+    <span class="muted" id="status"></span>
+  </div>
+
+  <div id="out" class="card" style="display:none;"></div>
+
+  <script>
+    const API_BASE = "http://127.0.0.1:8000";
+
+    function fmt(x) {
+      if (x === null || x === undefined) return "-";
+      if (typeof x === "number") return x.toFixed(2);
+      return String(x);
+    }
+
+    async function run() {
+      const t = document.getElementById("ticker").value.trim().toUpperCase() || "NVDA";
+      const status = document.getElementById("status");
+      const out = document.getElementById("out");
+      out.style.display = "none";
+      status.textContent = "Running...";
+
+      try {
+        const res = await fetch(`${API_BASE}/analyze?ticker=${encodeURIComponent(t)}`);
+        const data = await res.json();
+
+        status.textContent = "";
+
+        if (data.signal === "LONG") {
+          out.innerHTML = `
+            <div class="big">✅ LONG SETUP (${data.ticker})</div>
+            <div class="muted">Session date (ET): ${data.session_date_et}</div>
+            <hr />
+
+            <h3>Buy / Sell Plan</h3>
+            <ul>
+              <li><b>BUY when price breaks above:</b> ${fmt(data.entry_buy_above)}</li>
+              <li><b>STOP (sell if wrong) below:</b> ${fmt(data.stop_sell_below)}</li>
+              <li><b>TAKE PROFIT 1:</b> ${fmt(data.take_profit_1)}</li>
+              <li><b>TAKE PROFIT 2:</b> ${fmt(data.take_profit_2)}</li>
+            </ul>
+
+            <h3>Why</h3>
+            <ul>
+              <li>Manipulation candle: range15 ${fmt(data.range15)} >= threshold ${fmt(data.threshold)}</li>
+              <li>Reversal pattern: ${data.pattern} at ${data.signal_time_et}</li>
+               <li><b>RISK PER SHARE:</b> ${fmt(data.risk_per_share)}</li>
+            </ul>
+
+            <h3>Levels</h3>
+            <ul>
+              <li>L15: ${fmt(data.l15)} | MID: ${fmt(data.mid)} | H15: ${fmt(data.h15)}</li>
+              <li>ATR14: ${fmt(data.atr14)}</li>
+            </ul>
+
+            <h3>Raw JSON</h3>
+            <pre>${JSON.stringify(data, null, 2)}</pre>
+          `;
+        } else {
+          out.innerHTML = `
+            <div class="big">⛔ NO TRADE (${data.ticker || t})</div>
+            <div class="muted">Reason: ${data.reason || "N/A"}</div>
+            <div class="muted">Session date (ET): ${data.session_date_et || "-"}</div>
+            <hr />
+            <pre>${JSON.stringify(data, null, 2)}</pre>
+          `;
+        }
+
+        out.style.display = "block";
+
+      } catch (e) {
+        status.textContent = "Error. Is the backend running?";
+        out.style.display = "block";
+        out.innerHTML = `<div class="big">❌ Error</div><pre>${String(e)}</pre>`;
+      }
+    }
+
+    document.getElementById("run").addEventListener("click", run);
+    run(); // auto-run on load
+  </script>
+</body>
+</html>
