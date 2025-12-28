@@ -5,20 +5,37 @@
   <title>Pattern / Paddler Scalp (Long Only)</title>
   <style>
     body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 16px; }
-    input { padding: 8px; font-size: 16px; width: 140px; }
+    input, select { padding: 8px; font-size: 16px; }
+    input { width: 140px; }
     button { padding: 8px 12px; font-size: 16px; cursor: pointer; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-top: 16px; }
     .big { font-size: 22px; font-weight: bold; }
     .muted { color: #666; }
     pre { background: #f7f7f7; padding: 12px; border-radius: 8px; overflow: auto; }
-    .row { display: flex; gap: 10px; align-items: center; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .banner {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid #f0c36d;
+      border-radius: 8px;
+      background: #fff7e6;
+    }
   </style>
 </head>
+
 <body>
   <h1>Pattern / Paddler Scalp — Long Only</h1>
+
   <div class="row">
+    <label>Strategy:</label>
+    <select id="strategy">
+      <option value="pattern">Pattern Scalp (15m Manipulation)</option>
+      <option value="gap">Gap Momentum (Gap-Up)</option>
+    </select>
+
     <label>Ticker:</label>
     <input id="ticker" value="NVDA" />
+
     <button id="run">Analyze</button>
     <span class="muted" id="status"></span>
   </div>
@@ -35,43 +52,48 @@
     }
 
     async function run() {
-      const t = document.getElementById("ticker").value.trim().toUpperCase() || "NVDA";
+      const ticker = document.getElementById("ticker").value.trim().toUpperCase() || "NVDA";
+      const strategy = document.getElementById("strategy").value;
+      const endpoint = strategy === "gap" ? "gap_analyze" : "analyze";
+
       const status = document.getElementById("status");
       const out = document.getElementById("out");
+
       out.style.display = "none";
       status.textContent = "Running...";
 
       try {
-        const res = await fetch(`${API_BASE}/analyze?ticker=${encodeURIComponent(t)}`);
+        const res = await fetch(`${API_BASE}/${endpoint}?ticker=${encodeURIComponent(ticker)}`);
         const data = await res.json();
-
         status.textContent = "";
+
+        const banner = data.market_open === false
+          ? `<div class="banner">⚠️ ${data.note}</div>`
+          : "";
 
         if (data.signal === "LONG") {
           out.innerHTML = `
             <div class="big">✅ LONG SETUP (${data.ticker})</div>
-            <div class="muted">Session date (ET): ${data.session_date_et}</div>
+            <div class="muted">Strategy: ${data.strategy || "PATTERN_SCALP"}</div>
+            <div class="muted">Session date (ET): ${data.session_date_et || "-"}</div>
+            ${banner}
             <hr />
 
             <h3>Buy / Sell Plan</h3>
             <ul>
-              <li><b>BUY when price breaks above:</b> ${fmt(data.entry_buy_above)}</li>
-              <li><b>STOP (sell if wrong) below:</b> ${fmt(data.stop_sell_below)}</li>
-              <li><b>TAKE PROFIT 1:</b> ${fmt(data.take_profit_1)}</li>
-              <li><b>TAKE PROFIT 2:</b> ${fmt(data.take_profit_2)}</li>
+              <li><b>BUY above:</b> ${fmt(data.entry_buy_above)}</li>
+              <li><b>STOP below:</b> ${fmt(data.stop_sell_below)}</li>
+              ${data.take_profit_1 !== undefined ? `<li><b>TAKE PROFIT 1:</b> ${fmt(data.take_profit_1)}</li>` : ""}
+              ${data.take_profit_2 !== undefined ? `<li><b>TAKE PROFIT 2:</b> ${fmt(data.take_profit_2)}</li>` : ""}
+              ${data.risk_per_share !== undefined ? `<li><b>RISK PER SHARE:</b> ${fmt(data.risk_per_share)}</li>` : ""}
             </ul>
 
             <h3>Why</h3>
             <ul>
-              <li>Manipulation candle: range15 ${fmt(data.range15)} >= threshold ${fmt(data.threshold)}</li>
-              <li>Reversal pattern: ${data.pattern} at ${data.signal_time_et}</li>
-               <li><b>RISK PER SHARE:</b> ${fmt(data.risk_per_share)}</li>
-            </ul>
-
-            <h3>Levels</h3>
-            <ul>
-              <li>L15: ${fmt(data.l15)} | MID: ${fmt(data.mid)} | H15: ${fmt(data.h15)}</li>
-              <li>ATR14: ${fmt(data.atr14)}</li>
+              ${data.pattern ? `<li>Reversal pattern: ${data.pattern} @ ${data.signal_time_et}</li>` : ""}
+              ${data.setup ? `<li>Setup: ${data.setup}</li>` : ""}
+              ${data.gap_pct !== undefined ? `<li>Gap: ${fmt(data.gap_pct)}%</li>` : ""}
+              ${data.range15 !== undefined ? `<li>15m Range ≥ 20% ATR</li>` : ""}
             </ul>
 
             <h3>Raw JSON</h3>
@@ -79,9 +101,10 @@
           `;
         } else {
           out.innerHTML = `
-            <div class="big">⛔ NO TRADE (${data.ticker || t})</div>
+            <div class="big">⛔ NO TRADE (${data.ticker || ticker})</div>
             <div class="muted">Reason: ${data.reason || "N/A"}</div>
             <div class="muted">Session date (ET): ${data.session_date_et || "-"}</div>
+            ${banner}
             <hr />
             <pre>${JSON.stringify(data, null, 2)}</pre>
           `;

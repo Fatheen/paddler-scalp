@@ -3,8 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import time as dtime
-
+from datetime import datetime, time as dtime
+import pytz
 app = FastAPI(title="NVDA Long-Only Pattern Scalp API")
 
 # Allow frontend to call backend in dev
@@ -206,6 +206,217 @@ def analyze_long_only(ticker: str):
         "r_to_tp2": round(r_tp2, 3) if r_tp2 is not None else None,
     }
 
+# ======================
+# Gap Momentum Strategy (Single Ticker)
+# ======================
+
+def _linear_slope(y: np.ndarray) -> float:
+    n = len(y)
+    if n < 2:
+        return 0.0
+    x = np.arange(n, dtype=float)
+    xm = x.mean()
+    ym = y.mean()
+    denom = ((x - xm) ** 2).sum()
+    if denom == 0:
+        return 0.0
+    return float(((x - xm) * (y - ym)).sum() / denom)
+
+
+def _market_closed_banner() -> dict:
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    # Weekend => closed
+    if now.weekday() >= 5:
+        return {"market_open": False, "note": "Market closed (weekend) — results use last trading day data."}
+    # Before open
+    if now.time() < dtime(9, 30):
+        return {"market_open": False, "note": "Market not open yet — results may use last available data."}
+    return {"market_open": True, "note": ""}
+
+
+def gap_analyze_long_only(
+    ticker: str,
+    gap_min_pct: float = 3.0,
+    downtrend_lookback: int = 20,
+    res_lookback: int = 20,
+    max_above_res_pct: float = 8.0,   # loosened so you actually see candidates
+    min_rel_vol: float = 0.0,         # rel vol off by default (yfinance daily vol is weird early)
+):
+    ticker = ticker.upper().strip()
+
+    daily = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=False)
+    if daily is None or daily.empty or len(daily) < 3:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Not enough daily data"}
+        out.update(_market_closed_banner())
+        return out
+
+    # gap % using last two sessions
+    y_close = float(daily["Close"].iloc[-2])
+    t_open = float(daily["Open"].iloc[-1])
+    if y_close <= 0:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Invalid prices"}
+        out.update(_market_closed_banner())
+        return out
+
+    gap_pct = (t_open - y_close) / y_close * 100.0
+    if gap_pct < gap_min_pct:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": f"Gap too small ({gap_pct:.2f}%)", "gap_pct": round(gap_pct, 3)}
+        out.update(_market_closed_banner())
+        return out
+
+    if t_open <= y_close:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Not a gap up", "gap_pct": round(gap_pct, 3)}
+        out.update(_market_closed_banner())
+        return out
+
+    # Downtrend ending proxy: negative slope of closes over last N days (excluding today)
+    if len(daily) < downtrend_lookback + 2:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Not enough history for downtrend check", "gap_pct": round(gap_pct, 3)}
+        out.update(_market_closed_banner())
+        return out
+
+    closes = daily["Close"].astype(float).iloc[-(downtrend_lookback+1):-1].values
+    slope = _linear_slope(closes)
+    if slope >= 0:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Not ending a downtrend (slope not negative)", "gap_pct": round(gap_pct, 3)}
+        out.update(_market_closed_banner())
+        return out
+
+    # Resistance proxy: max high of last N days (excluding today)
+    recent = daily.iloc[-(res_lookback+1):-1]
+    res = float(recent["High"].astype(float).max())
+    above_pct = (t_open - res) / res * 100.0 if res > 0 else None
+
+    if not (t_open > res):
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Did not open above resistance", "gap_pct": round(gap_pct, 3),
+               "resistance": round(res, 4), "above_res_pct": round(above_pct, 3) if above_pct is not None else None}
+        out.update(_market_closed_banner())
+        return out
+
+    if above_pct is not None and above_pct > max_above_res_pct:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Too extended above resistance", "gap_pct": round(gap_pct, 3),
+               "resistance": round(res, 4), "above_res_pct": round(above_pct, 3)}
+        out.update(_market_closed_banner())
+        return out
+
+    # Rel vol (optional) — OFF by default
+    rel_vol = None
+    if min_rel_vol and min_rel_vol > 0:
+        if len(daily) >= 22:
+            today_vol = float(daily["Volume"].iloc[-1])
+            avg_vol = float(daily["Volume"].iloc[-21:-1].mean())
+            if avg_vol > 0:
+                rel_vol = today_vol / avg_vol
+                if rel_vol < min_rel_vol:
+                    out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Relative volume too low",
+                           "gap_pct": round(gap_pct, 3), "rel_vol": round(rel_vol, 3)}
+                    out.update(_market_closed_banner())
+                    return out
+
+    # Intraday 5m window (first 30 min ET)
+    df5 = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=False)
+    if df5 is None or df5.empty:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "No 5m data", "gap_pct": round(gap_pct, 3)}
+        out.update(_market_closed_banner())
+        return out
+
+    df5 = ensure_et(df5)
+    last_day = df5.index.date[-1]
+    day = df5[df5.index.date == last_day]
+    t = day.index.time
+    win = day[(t >= dtime(9, 30)) & (t < dtime(10, 0))]
+
+    if win is None or len(win) < 3:
+        out = {"ticker": ticker, "signal": "NO_TRADE", "reason": "Not enough 5m bars in first 30 minutes yet",
+               "gap_pct": round(gap_pct, 3), "resistance": round(res, 4), "above_res_pct": round(above_pct, 3)}
+        out.update(_market_closed_banner())
+        return out
+
+    # --- Setup 1: ORB (first 5m narrow-ish)
+    ranges = (win["High"] - win["Low"]).astype(float)
+    med = float(ranges.median()) if len(ranges) else 0.0
+    first = win.iloc[0]
+    first_range = float(first["High"] - first["Low"])
+
+    setup = None
+    entry = None
+    stop = None
+
+    if med > 0 and first_range <= med * 0.8:
+        setup = "ORB (first 5m narrow)"
+        entry = float(first["High"])
+        stop = float(first["Low"])
+    else:
+        # --- Setup 2: simple base breakout (2–3 small bars after first)
+        for start in range(1, min(4, len(win)-2)):
+            for length in (2, 3):
+                end = start + length
+                if end >= len(win):
+                    continue
+                chunk = win.iloc[start:end]
+                chunk_ranges = (chunk["High"] - chunk["Low"]).astype(float)
+                if med > 0 and (chunk_ranges <= med * 0.8).all():
+                    setup = f"Simple Breakout Base ({length} bars)"
+                    entry = float(chunk["High"].max())
+                    stop = float(chunk["Low"].min())
+                    break
+            if setup:
+                break
+
+    if setup is None:
+        # --- Setup 3: retracement to rising 20MA (computed over df5)
+        df5["ma20"] = df5["Close"].astype(float).rolling(20).mean()
+        ma_tail = df5["ma20"].dropna().tail(5).values
+        if len(ma_tail) >= 5 and _linear_slope(ma_tail) > 0:
+            for i in range(1, len(win)):
+                c = win.iloc[i]
+                ma = float(df5.loc[win.index[i], "ma20"]) if win.index[i] in df5.index else None
+                if ma is None or not np.isfinite(ma) or ma <= 0:
+                    continue
+                low = float(c["Low"])
+                high = float(c["High"])
+                if abs(low - ma) / ma <= 0.002 or (low <= ma <= high):
+                    setup = "Retracement to rising 20MA"
+                    entry = high
+                    stop = low
+                    break
+
+    if setup is None:
+        out = {
+            "ticker": ticker,
+            "signal": "NO_TRADE",
+            "reason": "Gap qualifies, but no clean setup in first 30m",
+            "gap_pct": round(gap_pct, 3),
+            "open": round(t_open, 4),
+            "prev_close": round(y_close, 4),
+            "resistance": round(res, 4),
+            "above_res_pct": round(above_pct, 3),
+            "rel_vol": round(rel_vol, 3) if rel_vol is not None else None,
+        }
+        out.update(_market_closed_banner())
+        return out
+
+    risk = (entry - stop) if (entry is not None and stop is not None and entry > stop) else None
+
+    out = {
+        "ticker": ticker,
+        "signal": "LONG",
+        "strategy": "GAP_MOMENTUM",
+        "setup": setup,
+        "gap_pct": round(gap_pct, 3),
+        "open": round(t_open, 4),
+        "prev_close": round(y_close, 4),
+        "resistance": round(res, 4),
+        "above_res_pct": round(above_pct, 3),
+        "rel_vol": round(rel_vol, 3) if rel_vol is not None else None,
+        "entry_buy_above": round(float(entry), 4),
+        "stop_sell_below": round(float(stop), 4),
+        "risk_per_share": round(float(risk), 4) if risk is not None else None,
+    }
+    out.update(_market_closed_banner())
+    return out
+
 
 @app.get("/health")
 def health():
@@ -215,3 +426,7 @@ def health():
 @app.get("/analyze")
 def analyze(ticker: str = "NVDA"):
     return analyze_long_only(ticker)
+
+@app.get("/gap_analyze")
+def gap_analyze(ticker: str = "NVDA"):
+    return gap_analyze_long_only(ticker)
