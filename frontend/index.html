@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <title>Pattern / Paddler Scalp (Long Only)</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 16px; }
+    body { font-family: Arial, sans-serif; max-width: 1100px; margin: 30px auto; padding: 0 16px; }
     input, select { padding: 8px; font-size: 16px; }
     input { width: 140px; }
     button { padding: 8px 12px; font-size: 16px; cursor: pointer; }
@@ -20,6 +20,24 @@
       border-radius: 8px;
       background: #fff7e6;
     }
+    .mini { font-size: 13px; color: #777; }
+    progress { width: 360px; height: 16px; vertical-align: middle; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 14px; }
+    th { background: #fafafa; cursor: pointer; user-select: none; position: sticky; top: 0; }
+    tr:hover { background: #f7fbff; }
+    .right { text-align: right; }
+    .nowrap { white-space: nowrap; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border: 1px solid #ddd;
+      border-radius: 999px;
+      background: #fafafa;
+      font-size: 12px;
+    }
+    .good { color: #137333; font-weight: 700; }
   </style>
 </head>
 
@@ -40,6 +58,44 @@
     <span class="muted" id="status"></span>
   </div>
 
+  <!-- Scanner controls -->
+  <div class="row" style="margin-top:12px;">
+    <button id="scanLongs">Scan S&P500 → LONG setups only</button>
+    <span class="pill" id="scanCounts" style="display:none;"></span>
+  </div>
+
+  <div class="row mini" id="scanMeta" style="display:none; margin-top:6px;">
+    <progress id="scanProg" value="0" max="100"></progress>
+    <span id="scanProgText">0%</span>
+    <span id="scanNote"></span>
+  </div>
+
+  <!-- Results table -->
+  <div id="tableWrap" class="card" style="display:none;">
+    <div class="big">✅ LONG Setups Found</div>
+    <div class="muted">Click a column header to sort. (Default: Expected Profit % desc)</div>
+    <div style="max-height: 520px; overflow: auto; margin-top: 10px;">
+      <table id="resultsTable">
+        <thead>
+          <tr>
+            <th data-k="ticker">Ticker</th>
+            <th data-k="session_date_et" class="nowrap">Session (ET)</th>
+            <th data-k="pattern">Pattern</th>
+            <th data-k="entry_buy_above" class="right">Buy Above</th>
+            <th data-k="stop_sell_below" class="right">Stop Below</th>
+            <th data-k="risk_per_share" class="right">Risk/Share</th>
+            <th data-k="take_profit_1" class="right">TP1</th>
+            <th data-k="take_profit_2" class="right">TP2</th>
+            <th data-k="expected_profit_pct" class="right">Expected Profit %</th>
+            <th data-k="r_to_tp2" class="right">R to TP2</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Single-ticker output -->
   <div id="out" class="card" style="display:none;"></div>
 
   <script>
@@ -50,8 +106,13 @@
       if (typeof x === "number") return x.toFixed(2);
       return String(x);
     }
+    function fmt4(x) {
+      if (x === null || x === undefined) return "-";
+      if (typeof x === "number") return x.toFixed(4);
+      return String(x);
+    }
 
-    async function run() {
+    async function runSingle() {
       const ticker = document.getElementById("ticker").value.trim().toUpperCase() || "NVDA";
       const strategy = document.getElementById("strategy").value;
       const endpoint = strategy === "gap" ? "gap_analyze" : "analyze";
@@ -91,8 +152,6 @@
             <h3>Why</h3>
             <ul>
               ${data.pattern ? `<li>Reversal pattern: ${data.pattern} @ ${data.signal_time_et}</li>` : ""}
-              ${data.setup ? `<li>Setup: ${data.setup}</li>` : ""}
-              ${data.gap_pct !== undefined ? `<li>Gap: ${fmt(data.gap_pct)}%</li>` : ""}
               ${data.range15 !== undefined ? `<li>15m Range ≥ 20% ATR</li>` : ""}
             </ul>
 
@@ -119,8 +178,198 @@
       }
     }
 
-    document.getElementById("run").addEventListener("click", run);
-    run(); // auto-run on load
+    // -------------------------
+    // LONG scanner + sortable table
+    // -------------------------
+    let tableRows = [];
+    let sortKey = "expected_profit_pct";
+    let sortDir = "desc"; // "asc" or "desc"
+
+    function computeExpectedProfitPct(entry, tp2) {
+      if (!Number.isFinite(entry) || entry <= 0) return null;
+      if (!Number.isFinite(tp2)) return null;
+      return ((tp2 - entry) / entry) * 100.0;
+    }
+
+    function renderTable() {
+      const wrap = document.getElementById("tableWrap");
+      const tbody = document.getElementById("tbody");
+      wrap.style.display = "block";
+
+      const rows = [...tableRows].sort((a, b) => {
+        const va = a[sortKey];
+        const vb = b[sortKey];
+
+        // nulls last
+        const aNull = (va === null || va === undefined || (typeof va === "number" && !isFinite(va)));
+        const bNull = (vb === null || vb === undefined || (typeof vb === "number" && !isFinite(vb)));
+        if (aNull && bNull) return 0;
+        if (aNull) return 1;
+        if (bNull) return -1;
+
+        // numeric vs string
+        if (typeof va === "number" && typeof vb === "number") {
+          return sortDir === "asc" ? (va - vb) : (vb - va);
+        }
+        const sa = String(va);
+        const sb = String(vb);
+        return sortDir === "asc" ? sa.localeCompare(sb) : sb.localeCompare(sa);
+      });
+
+      tbody.innerHTML = rows.map(r => {
+        const ep = r.expected_profit_pct;
+        const epCell = (ep === null || ep === undefined) ? "-" : `${ep.toFixed(2)}%`;
+        return `
+          <tr>
+            <td class="nowrap"><b>${r.ticker}</b></td>
+            <td class="nowrap">${r.session_date_et || "-"}</td>
+            <td>${r.pattern || "-"}</td>
+            <td class="right">${fmt4(r.entry_buy_above)}</td>
+            <td class="right">${fmt4(r.stop_sell_below)}</td>
+            <td class="right">${fmt4(r.risk_per_share)}</td>
+            <td class="right">${fmt4(r.take_profit_1)}</td>
+            <td class="right">${fmt4(r.take_profit_2)}</td>
+            <td class="right good">${epCell}</td>
+            <td class="right">${r.r_to_tp2 !== undefined && r.r_to_tp2 !== null ? r.r_to_tp2.toFixed(3) : "-"}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function attachSortHandlers() {
+      const ths = document.querySelectorAll("#resultsTable thead th");
+      ths.forEach(th => {
+        th.addEventListener("click", () => {
+          const k = th.getAttribute("data-k");
+          if (!k) return;
+          if (sortKey === k) {
+            sortDir = (sortDir === "asc") ? "desc" : "asc";
+          } else {
+            sortKey = k;
+            sortDir = "desc";
+          }
+          renderTable();
+        });
+      });
+    }
+
+    async function scanSp500Longs() {
+      const status = document.getElementById("status");
+      const meta = document.getElementById("scanMeta");
+      const prog = document.getElementById("scanProg");
+      const progText = document.getElementById("scanProgText");
+      const note = document.getElementById("scanNote");
+      const counts = document.getElementById("scanCounts");
+      const tableWrap = document.getElementById("tableWrap");
+
+      // reset UI
+      tableRows = [];
+      tableWrap.style.display = "none";
+      counts.style.display = "none";
+      meta.style.display = "flex";
+      prog.value = 0;
+      progText.textContent = "0%";
+      note.textContent = "Getting manipulation list...";
+      status.textContent = "Scanning...";
+
+      try {
+        // 1) fetch manipulation tickers list
+        const res = await fetch(`${API_BASE}/manipulation_list`);
+        const data = await res.json();
+
+        if (data.signal !== "OK") {
+          status.textContent = "";
+          note.textContent = data.reason || "Failed to load manipulation list.";
+          return;
+        }
+
+        const tickers = data.tickers || [];
+        const total = tickers.length;
+        let done = 0;
+        let longs = 0;
+
+        counts.style.display = "inline-block";
+        counts.textContent = `0 LONG / ${total} scanned`;
+
+        // banner note if weekend etc.
+        note.textContent = (data.market_open === false && data.note)
+          ? `⚠️ ${data.note}  Now checking LONG setups...`
+          : "Now checking LONG setups...";
+
+        // 2) call /analyze for each ticker (throttle to avoid hammering)
+        // simple sequential loop (most reliable). If you want faster, we can do limited concurrency.
+        for (const t of tickers) {
+          done += 1;
+          prog.value = total ? (done / total) * 100 : 100;
+          progText.textContent = `${Math.round(prog.value)}%`;
+          counts.textContent = `${longs} LONG / ${done} scanned`;
+          status.textContent = `Checking ${t} (${done}/${total})...`;
+
+          try {
+            const r2 = await fetch(`${API_BASE}/analyze?ticker=${encodeURIComponent(t)}`);
+            const a = await r2.json();
+
+            if (a && a.signal === "LONG") {
+              const entry = Number(a.entry_buy_above);
+              const tp2 = Number(a.take_profit_2);
+              const expected_profit_pct = computeExpectedProfitPct(entry, tp2);
+
+              tableRows.push({
+                ticker: a.ticker || t,
+                session_date_et: a.session_date_et || "",
+                pattern: a.pattern || "",
+                entry_buy_above: entry,
+                stop_sell_below: Number(a.stop_sell_below),
+                risk_per_share: Number(a.risk_per_share),
+                take_profit_1: (a.take_profit_1 !== undefined ? Number(a.take_profit_1) : null),
+                take_profit_2: (a.take_profit_2 !== undefined ? Number(a.take_profit_2) : null),
+                expected_profit_pct: expected_profit_pct,
+                r_to_tp2: (a.r_to_tp2 !== undefined ? Number(a.r_to_tp2) : null),
+              });
+
+              longs += 1;
+              counts.textContent = `${longs} LONG / ${done} scanned`;
+
+              // render live as we find them (nice UX)
+              renderTable();
+            }
+          } catch (innerErr) {
+            // ignore per-ticker errors
+          }
+
+          // tiny delay so we don't spike requests too hard
+          await new Promise(r => setTimeout(r, 80));
+        }
+
+        status.textContent = "";
+        prog.value = 100;
+        progText.textContent = "100%";
+
+        if (!tableRows.length) {
+          note.textContent = "Done. No LONG setups found from the manipulation list.";
+          counts.textContent = `0 LONG / ${total} scanned`;
+          return;
+        }
+
+        // default sort by expected profit desc
+        sortKey = "expected_profit_pct";
+        sortDir = "desc";
+        renderTable();
+
+        note.textContent = `Done. Found ${tableRows.length} LONG setups (sorted by Expected Profit %).`;
+        counts.textContent = `${tableRows.length} LONG / ${total} scanned`;
+
+      } catch (e) {
+        status.textContent = "";
+        note.textContent = "Error scanning. Is backend running?";
+      }
+    }
+
+    document.getElementById("run").addEventListener("click", runSingle);
+    document.getElementById("scanLongs").addEventListener("click", scanSp500Longs);
+
+    attachSortHandlers();
+    runSingle(); // auto-run on load
   </script>
 </body>
 </html>

@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, time as dtime
 import pytz
+import requests
+from typing import List
 app = FastAPI(title="NVDA Long-Only Pattern Scalp API")
 
 # Allow frontend to call backend in dev
@@ -417,6 +419,71 @@ def gap_analyze_long_only(
     out.update(_market_closed_banner())
     return out
 
+def fetch_sp500_symbols() -> List[str]:
+    """
+    Fetch current S&P 500 symbols from Wikipedia.
+    Converts BRK.B -> BRK-B (yfinance format).
+    """
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    r.raise_for_status()
+    tables = pd.read_html(r.text)
+
+    for tbl in tables:
+        # Usually has a column named "Symbol"
+        if "Symbol" in tbl.columns:
+            syms = tbl["Symbol"].astype(str).str.replace(".", "-", regex=False)
+            return sorted(set(syms.tolist()))
+
+    raise ValueError("Could not find S&P 500 symbols table.")
+
+
+def has_manipulation_candle(ticker: str) -> dict:
+    """
+    Return:
+      {
+        ticker, ok, manipulation, range15, threshold, atr14, h15, l15, session_date_et, reason
+      }
+    """
+    ticker = ticker.upper().strip()
+
+    daily = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=False)
+    atr = compute_atr14(daily)
+    if atr is None:
+        return {"ticker": ticker, "ok": False, "manipulation": False, "reason": "ATR14 unavailable"}
+
+    intra_1m = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False)
+    if intra_1m is None or intra_1m.empty:
+        return {"ticker": ticker, "ok": False, "manipulation": False, "reason": "No intraday 1m data"}
+
+    intra_et = ensure_et(intra_1m)
+    session_date = str(intra_et.index.date[-1])
+
+    h15, l15 = first_15m_hl(intra_1m)
+    if h15 is None or l15 is None:
+        return {
+            "ticker": ticker,
+            "ok": True,
+            "manipulation": False,
+            "session_date_et": session_date,
+            "reason": "Not enough 1m bars yet (run after 9:45 ET)",
+        }
+
+    range15 = float(h15 - l15)
+    threshold = float(atr * ATR_FRAC)
+
+    return {
+        "ticker": ticker,
+        "ok": True,
+        "manipulation": bool(range15 >= threshold),
+        "session_date_et": session_date,
+        "range15": round(range15, 4),
+        "threshold": round(threshold, 4),
+        "atr14": round(float(atr), 4),
+        "h15": round(float(h15), 4),
+        "l15": round(float(l15), 4),
+        "reason": "" if range15 >= threshold else "range15 < 20% ATR",
+    }
 
 @app.get("/health")
 def health():
@@ -430,3 +497,54 @@ def analyze(ticker: str = "NVDA"):
 @app.get("/gap_analyze")
 def gap_analyze(ticker: str = "NVDA"):
     return gap_analyze_long_only(ticker)
+
+@app.get("/manipulation_list")
+def manipulation_list(limit: int = 200):
+    """
+    Returns a list of S&P 500 tickers that have a manipulation candle today:
+      range15 >= 20% ATR14
+    NOTE: This can be slow. It scans the whole S&P 500.
+    """
+    banner = _market_closed_banner()
+
+    try:
+        tickers = fetch_sp500_symbols()
+    except Exception as e:
+        out = {
+            "signal": "ERROR",
+            "reason": f"Failed to fetch S&P 500 list: {e}",
+            "tickers": [],
+            "details": [],
+        }
+        out.update(banner)
+        return out
+
+    winners = []
+    details = []
+    scanned = 0
+    errors = 0
+
+    for t in tickers:
+        scanned += 1
+        try:
+            r = has_manipulation_candle(t)
+            details.append(r)
+            if r.get("manipulation") is True:
+                winners.append(t)
+        except Exception:
+            errors += 1
+            continue
+
+    winners = sorted(set(winners))[: max(1, min(limit, 500))]
+
+    out = {
+        "signal": "OK",
+        "scanned": scanned,
+        "errors": errors,
+        "count": len(winners),
+        "tickers": winners,
+        # keep details in case you want to show range15/threshold later
+        "details": details,
+    }
+    out.update(banner)
+    return out
